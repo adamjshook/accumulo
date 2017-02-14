@@ -34,6 +34,7 @@ import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.client.AccumuloException;
@@ -207,6 +208,8 @@ public class Master extends AccumuloServerContext implements LiveTServerSet.List
   Fate<Master> fate;
 
   volatile SortedMap<TServerInstance,TabletServerStatus> tserverStatus = Collections.unmodifiableSortedMap(new TreeMap<TServerInstance,TabletServerStatus>());
+
+  private AtomicLong replicationLatency = new AtomicLong(0l);
 
   @Override
   public synchronized MasterState getMasterState() {
@@ -1579,5 +1582,13 @@ public class Master extends AccumuloServerContext implements LiveTServerSet.List
     synchronized (serversToShutdown) {
       return new HashSet<>(serversToShutdown);
     }
+  }
+
+  public long getReplicationLatency() {
+    return replicationLatency.get();
+  }
+
+  public void setReplicationLatency(long latency) {
+    this.replicationLatency.set(latency);
   }
 }
