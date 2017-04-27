@@ -17,6 +17,7 @@
 package org.apache.accumulo.tserver.replication;
 
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -31,6 +32,12 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.accumulo.core.client.AccumuloException;
@@ -288,14 +295,35 @@ public class AccumuloReplicaSystem implements ReplicaSystem {
             }
           } else {
             span = Trace.start("WAL replication");
+
+            ExecutorService executor = Executors.newFixedThreadPool(1);
+
             try {
-              finalStatus = replicateLogs(peerContext, peerTserver, target, p, status, sizeLimit, remoteTableId, peerContext.rpcCreds(), helper, accumuloUgi);
+              Future<Status> replStatus = executor.submit(new Callable<Status>() {
+                @Override
+                public Status call() throws Exception {
+                  return replicateLogs(peerContext, peerTserver, target, p, status, sizeLimit, remoteTableId, peerContext.rpcCreds(), helper, accumuloUgi);
+                }
+              });
+
+              log.debug("Getting replication status with timeout {}", conf.get(Property.REPLICATION_TIMEOUT));
+              finalStatus = replStatus.get(conf.getTimeInMillis(Property.REPLICATION_TIMEOUT), MILLISECONDS);
+              log.debug("New status for {} after replicating to {} is {}", p, peerContext.getInstance(), ProtobufUtil.toString(finalStatus));
+            } catch (InterruptedException e) {
+              log.debug("Interrupted exception during replication", e);
+              Thread.currentThread().interrupt();
+              finalStatus = status;
+            } catch (ExecutionException e) {
+              log.warn("Caught execution exception", e);
+              finalStatus = status;
+            } catch (TimeoutException e) {
+              log.debug("Replication timeout triggered, task will be retried by the framework");
+              finalStatus = status;
             } finally {
               span.stop();
+              executor.shutdownNow();
             }
           }
-
-          log.debug("New status for {} after replicating to {} is {}", p, peerContext.getInstance(), ProtobufUtil.toString(finalStatus));
 
           return finalStatus;
         } catch (TTransportException | AccumuloException | AccumuloSecurityException e) {
@@ -416,6 +444,12 @@ public class AccumuloReplicaSystem implements ReplicaSystem {
     Status lastStatus = status, currentStatus = status;
     final AtomicReference<Exception> exceptionRef = new AtomicReference<>();
     while (true) {
+      // Check if the thread has been interrupted prior to replicating data
+      if (Thread.interrupted()) {
+        log.debug("Replication work interrupted, returning last status");
+        return lastStatus;
+      }
+
       // Set some trace info
       span = Trace.start("Replicate WAL batch");
       span.data("Batch size (bytes)", Long.toString(sizeLimit));
@@ -536,8 +570,21 @@ public class AccumuloReplicaSystem implements ReplicaSystem {
 
       // If we have some edits to send
       if (0 < edits.walEdits.getEditsSize()) {
+        // Check if we are interrupted before to writing the edits
+        if (Thread.interrupted()) {
+          log.debug("Replication work interrupted before writing edits, returning empty replication stats");
+          return new ReplicationStats(0L, 0L, 0L);
+        }
+
         log.debug("Sending {} edits", edits.walEdits.getEditsSize());
         long entriesReplicated = client.replicateLog(remoteTableId, edits.walEdits, tcreds);
+
+        // Check if we were interrupted after writing the edits
+        if (Thread.interrupted()) {
+          log.debug("Replication work interrupted after writing edits, returning empty replication stats");
+          return new ReplicationStats(0L, 0L, 0L);
+        }
+
         if (entriesReplicated != edits.numUpdates) {
           log.warn("Sent {} WAL entries for replication but {} were reported as replicated", edits.numUpdates, entriesReplicated);
         } else {

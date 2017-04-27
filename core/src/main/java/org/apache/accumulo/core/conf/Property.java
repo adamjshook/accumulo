@@ -584,6 +584,7 @@ public enum Property {
   REPLICATION_WORK_PROCESSOR_PERIOD("replication.work.processor.period", "0s", PropertyType.TIMEDURATION,
       "Amount of time to wait before re-checking for replication work, not useful outside of tests"),
   REPLICATION_TRACE_PERCENT("replication.trace.percent", "0.1", PropertyType.FRACTION, "The sampling percentage to use for replication traces"),
+  REPLICATION_TIMEOUT("replication.timeout", "10m", PropertyType.TIMEDURATION, "Amount of time given to replicate a file before failing the task"),
 
   ;
 
