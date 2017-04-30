@@ -17,16 +17,22 @@
 package org.apache.accumulo.tserver.replication;
 
 import static org.easymock.EasyMock.createMock;
+import static org.easymock.EasyMock.createMockBuilder;
 import static org.easymock.EasyMock.expect;
 import static org.easymock.EasyMock.replay;
 import static org.easymock.EasyMock.verify;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.File;
 import java.nio.ByteBuffer;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -36,6 +42,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
+import com.google.common.io.Files;
+import com.google.common.net.HostAndPort;
+import org.apache.accumulo.core.client.impl.ClientContext;
+import org.apache.accumulo.core.client.mock.MockInstance;
+import org.apache.accumulo.core.client.security.tokens.PasswordToken;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
 import org.apache.accumulo.core.conf.ConfigurationCopy;
 import org.apache.accumulo.core.conf.Property;
@@ -45,8 +56,13 @@ import org.apache.accumulo.core.data.impl.KeyExtent;
 import org.apache.accumulo.core.replication.ReplicationTarget;
 import org.apache.accumulo.core.replication.thrift.ReplicationServicer.Client;
 import org.apache.accumulo.core.replication.thrift.WalEdits;
+import org.apache.accumulo.core.rpc.SaslConnectionParams;
+import org.apache.accumulo.core.rpc.SslConnectionParams;
 import org.apache.accumulo.core.security.thrift.TCredentials;
 import org.apache.accumulo.server.data.ServerMutation;
+import org.apache.accumulo.server.fs.VolumeManager;
+import org.apache.accumulo.server.fs.VolumeManagerImpl;
+import org.apache.accumulo.server.replication.ReplicaSystemHelper;
 import org.apache.accumulo.server.replication.proto.Replication.Status;
 import org.apache.accumulo.tserver.logger.LogEvents;
 import org.apache.accumulo.tserver.logger.LogFileKey;
@@ -54,7 +70,10 @@ import org.apache.accumulo.tserver.logger.LogFileValue;
 import org.apache.accumulo.tserver.replication.AccumuloReplicaSystem.ReplicationStats;
 import org.apache.accumulo.tserver.replication.AccumuloReplicaSystem.WalClientExecReturn;
 import org.apache.accumulo.tserver.replication.AccumuloReplicaSystem.WalReplication;
+import org.apache.commons.io.FileUtils;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.server.datanode.Replica;
 import org.apache.hadoop.io.Text;
 import org.junit.Assert;
 import org.junit.Test;
@@ -524,5 +543,122 @@ public class AccumuloReplicaSystemTest {
 
     assertEquals(user, ars.getPrincipal(conf, target));
     assertEquals(keytab, ars.getKeytab(conf, target));
+  }
+
+  @Test
+  public void testReplicationTimeout() throws Exception
+  {
+    File rootPath = Files.createTempDir();
+
+    try {
+      VolumeManager volumeManager = VolumeManagerImpl.getLocal(rootPath.getAbsolutePath());
+      Path path = new Path(rootPath + "/accumulo/wals/localhost+9997/" + UUID.randomUUID().toString());
+      assertTrue(volumeManager.mkdirs(path.getParent()));
+      FSDataOutputStream dos = volumeManager.create(path);
+
+      LogFileKey key = new LogFileKey();
+      LogFileValue value = new LogFileValue();
+
+      // What is seq used for?
+      key.seq = 1l;
+
+      /*
+      * Disclaimer: the following series of LogFileKey and LogFileValue pairs have *no* bearing whatsoever in reality regarding what these entries would actually
+      * look like in a WAL. They are solely for testing that each LogEvents is handled, order is not important.
+      */
+      key.event = LogEvents.DEFINE_TABLET;
+      key.tablet = new KeyExtent(new Text("1"), null, null);
+      key.tid = 1;
+
+      key.write(dos);
+      value.write(dos);
+
+      key.tablet = null;
+      key.event = LogEvents.MUTATION;
+      key.filename = "/accumulo/wals/localhost+9997/" + UUID.randomUUID();
+      value.mutations = Arrays.<Mutation> asList(new ServerMutation(new Text("row")));
+
+      key.write(dos);
+      value.write(dos);
+
+      key.event = LogEvents.DEFINE_TABLET;
+      key.tablet = new KeyExtent(new Text("2"), null, null);
+      key.tid = 2;
+      value.mutations = Collections.emptyList();
+
+      key.write(dos);
+      value.write(dos);
+
+      key.event = LogEvents.OPEN;
+      key.tid = LogFileKey.VERSION;
+      key.tserverSession = "foobar";
+
+      key.write(dos);
+      value.write(dos);
+
+      key.tablet = null;
+      key.event = LogEvents.MUTATION;
+      key.filename = "/accumulo/wals/localhost+9997/" + UUID.randomUUID();
+      value.mutations = Arrays.<Mutation> asList(new ServerMutation(new Text("badrow")));
+
+      key.write(dos);
+      value.write(dos);
+
+      key.event = LogEvents.COMPACTION_START;
+      key.tid = 2;
+      key.filename = "/accumulo/tables/1/t-000001/A000001.rf";
+      value.mutations = Collections.emptyList();
+
+      key.write(dos);
+      value.write(dos);
+
+      key.event = LogEvents.DEFINE_TABLET;
+      key.tablet = new KeyExtent(new Text("1"), null, null);
+      key.tid = 3;
+      value.mutations = Collections.emptyList();
+
+      key.write(dos);
+      value.write(dos);
+
+      key.event = LogEvents.COMPACTION_FINISH;
+      key.tid = 6;
+      value.mutations = Collections.emptyList();
+
+      key.write(dos);
+      value.write(dos);
+
+      key.tablet = null;
+      key.event = LogEvents.MUTATION;
+      key.tid = 3;
+      key.filename = "/accumulo/wals/localhost+9997/" + UUID.randomUUID();
+      value.mutations = Arrays.<Mutation> asList(new ServerMutation(new Text("row")));
+
+      key.write(dos);
+      value.write(dos);
+      dos.close();
+
+      Map<String, String> confMap = new HashMap<>();
+      confMap.put(Property.REPLICATION_TIMEOUT.getKey(), "1ms");
+      confMap.put(Property.REPLICATION_MAX_UNIT_SIZE.getKey(), Integer.toString(Integer.MAX_VALUE));
+      AccumuloConfiguration conf = new ConfigurationCopy(confMap);
+
+      AccumuloReplicaSystem ars = new AccumuloReplicaSystem();
+      ars.setConf(conf);
+      ars.setFs(volumeManager);
+
+      Status status = Status.newBuilder().setBegin(0).setEnd(0).setInfiniteEnd(true).setClosed(false).build();
+      ClientContext clientContext = createMock(ClientContext.class);
+      expect(clientContext.rpcCreds()).andReturn(new TCredentials());
+      expect(clientContext.getInstance()).andReturn(new MockInstance());
+      expect(clientContext.getInstance()).andReturn(new MockInstance());
+      expect(clientContext.getClientSslParams()).andReturn(SslConnectionParams.forClient(conf));
+      expect(clientContext.getSaslParams()).andReturn(null);
+      replay(clientContext);
+
+      ReplicationTarget target = new ReplicationTarget("peer", "2", "1");
+      assertEquals(status, ars.replicateLogsWithTimeout(clientContext, HostAndPort.fromParts("localhost", 9997), target, path, status, createMock(ReplicaSystemHelper.class), null));
+    } finally {
+      FileUtils.deleteDirectory(rootPath);
+    }
   }
 }

@@ -40,6 +40,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.accumulo.core.client.AccumuloException;
 import org.apache.accumulo.core.client.AccumuloSecurityException;
 import org.apache.accumulo.core.client.Instance;
@@ -245,35 +246,13 @@ public class AccumuloReplicaSystem implements ReplicaSystem {
       ProbabilitySampler sampler = new ProbabilitySampler(tracePercent);
       Trace.on("AccumuloReplicaSystem", sampler);
 
-      // Remote identifier is an integer (table id) in this case.
-      final String remoteTableId = target.getRemoteIdentifier();
-
       // Attempt the replication of this status a number of times before giving up and
       // trying to replicate it again later some other time.
       int numAttempts = localConf.getCount(Property.REPLICATION_WORK_ATTEMPTS);
       for (int i = 0; i < numAttempts; i++) {
         log.debug("Attempt {}", i);
-        String peerTserverStr;
-        log.debug("Fetching peer tserver address");
-        Span span = Trace.start("Fetch peer tserver");
-        try {
-          // Ask the master on the remote what TServer we should talk with to replicate the data
-          peerTserverStr = ReplicationClient.executeCoordinatorWithReturn(peerContext, new ClientExecReturn<String,ReplicationCoordinator.Client>() {
 
-            @Override
-            public String execute(ReplicationCoordinator.Client client) throws Exception {
-              return client.getServicerAddress(remoteTableId, peerContext.rpcCreds());
-            }
-
-          });
-        } catch (AccumuloException | AccumuloSecurityException e) {
-          // No progress is made
-          log.error("Could not connect to master at {}, cannot proceed with replication. Will retry", target, e);
-          continue;
-        } finally {
-          span.stop();
-        }
-
+        String peerTserverStr = getPeerTServerAddress(peerContext, target);
         if (null == peerTserverStr) {
           // Something went wrong, and we didn't get a valid tserver from the remote for some reason
           log.warn("Did not receive tserver from master at {}, cannot proceed with replication. Will retry.", target);
@@ -287,41 +266,19 @@ public class AccumuloReplicaSystem implements ReplicaSystem {
         final long sizeLimit = conf.getMemoryInBytes(Property.REPLICATION_MAX_UNIT_SIZE);
         try {
           if (p.getName().endsWith(RFILE_SUFFIX)) {
-            span = Trace.start("RFile replication");
+            Span span = Trace.start("RFile replication");
             try {
-              finalStatus = replicateRFiles(peerContext, peerTserver, target, p, status, sizeLimit, remoteTableId, peerContext.rpcCreds(), helper);
+              finalStatus = replicateRFiles(peerContext, peerTserver, target, p, status, sizeLimit, target.getRemoteIdentifier(), peerContext.rpcCreds(), helper);
             } finally {
               span.stop();
             }
           } else {
-            span = Trace.start("WAL replication");
-
-            ExecutorService executor = Executors.newFixedThreadPool(1);
+            Span span = Trace.start("WAL replication");
 
             try {
-              Future<Status> replStatus = executor.submit(new Callable<Status>() {
-                @Override
-                public Status call() throws Exception {
-                  return replicateLogs(peerContext, peerTserver, target, p, status, sizeLimit, remoteTableId, peerContext.rpcCreds(), helper, accumuloUgi);
-                }
-              });
-
-              log.debug("Getting replication status with timeout {}", conf.get(Property.REPLICATION_TIMEOUT));
-              finalStatus = replStatus.get(conf.getTimeInMillis(Property.REPLICATION_TIMEOUT), MILLISECONDS);
-              log.debug("New status for {} after replicating to {} is {}", p, peerContext.getInstance(), ProtobufUtil.toString(finalStatus));
-            } catch (InterruptedException e) {
-              log.debug("Interrupted exception during replication", e);
-              Thread.currentThread().interrupt();
-              finalStatus = status;
-            } catch (ExecutionException e) {
-              log.warn("Caught execution exception", e);
-              finalStatus = status;
-            } catch (TimeoutException e) {
-              log.debug("Replication timeout triggered, task will be retried by the framework");
-              finalStatus = status;
+              finalStatus = replicateLogsWithTimeout(peerContext, peerTserver, target, p, status, helper, accumuloUgi);
             } finally {
               span.stop();
-              executor.shutdownNow();
             }
           }
 
@@ -339,6 +296,62 @@ public class AccumuloReplicaSystem implements ReplicaSystem {
     } finally {
       Trace.off();
     }
+  }
+
+  @VisibleForTesting
+  public String getPeerTServerAddress(final ClientContext peerContext, final ReplicationTarget target)
+  {
+    log.debug("Fetching peer tserver address");
+    Span span = Trace.start("Fetch peer tserver");
+    try {
+      // Ask the master on the remote what TServer we should talk with to replicate the data
+      return ReplicationClient.executeCoordinatorWithReturn(peerContext, new ClientExecReturn<String,ReplicationCoordinator.Client>() {
+
+        @Override
+        public String execute(ReplicationCoordinator.Client client) throws Exception {
+          return client.getServicerAddress(target.getRemoteIdentifier(), peerContext.rpcCreds());
+        }
+
+      });
+    } catch (AccumuloException | AccumuloSecurityException e) {
+      // No progress is made
+      log.error("Could not connect to master at {}, cannot proceed with replication. Will retry", target, e);
+    } finally {
+      span.stop();
+    }
+
+    return null;
+  }
+
+  @VisibleForTesting
+  public Status replicateLogsWithTimeout(final ClientContext peerContext, final HostAndPort peerTserver, final ReplicationTarget target,
+          final Path p, final Status status, final ReplicaSystemHelper helper, final UserGroupInformation accumuloUgi) {
+    ExecutorService executor = Executors.newFixedThreadPool(1);
+    Status finalStatus = status;
+
+    try {
+      Future<Status> replStatus = executor.submit(new Callable<Status>() {
+        @Override
+        public Status call() throws Exception {
+          return replicateLogs(peerContext, peerTserver, target, p, status, conf.getMemoryInBytes(Property.REPLICATION_MAX_UNIT_SIZE), target.getRemoteIdentifier(), peerContext.rpcCreds(), helper, accumuloUgi);
+        }
+      });
+
+      log.debug("Getting replication status with timeout {}", conf.get(Property.REPLICATION_TIMEOUT));
+      finalStatus = replStatus.get(conf.getTimeInMillis(Property.REPLICATION_TIMEOUT), MILLISECONDS);
+      log.debug("New status for {} after replicating to {} is {}", p, peerContext.getInstance(), ProtobufUtil.toString(finalStatus));
+    } catch (InterruptedException e) {
+      log.debug("Interrupted exception during replication", e);
+      Thread.currentThread().interrupt();
+    } catch (ExecutionException e) {
+      log.warn("Caught execution exception", e);
+    } catch (TimeoutException e) {
+      log.debug("Replication timeout triggered, task will be retried by the framework");
+    } finally {
+      executor.shutdownNow();
+    }
+
+    return finalStatus;
   }
 
   protected Status replicateRFiles(ClientContext peerContext, final HostAndPort peerTserver, final ReplicationTarget target, final Path p, final Status status,
