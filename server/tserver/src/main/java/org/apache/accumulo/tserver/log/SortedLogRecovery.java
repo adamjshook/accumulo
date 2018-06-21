@@ -17,13 +17,17 @@
 package org.apache.accumulo.tserver.log;
 
 import static com.google.common.base.Preconditions.checkState;
+import static java.lang.String.format;
 import static org.apache.accumulo.tserver.logger.LogEvents.COMPACTION_FINISH;
 import static org.apache.accumulo.tserver.logger.LogEvents.COMPACTION_START;
 import static org.apache.accumulo.tserver.logger.LogEvents.DEFINE_TABLET;
 import static org.apache.accumulo.tserver.logger.LogEvents.MANY_MUTATIONS;
 import static org.apache.accumulo.tserver.logger.LogEvents.MUTATION;
 
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -31,17 +35,27 @@ import java.util.List;
 import java.util.Map.Entry;
 import java.util.Set;
 
+import org.apache.accumulo.core.cli.Help;
+import org.apache.accumulo.core.client.Connector;
+import org.apache.accumulo.core.client.ZooKeeperInstance;
+import org.apache.accumulo.core.client.security.tokens.PasswordToken;
+import org.apache.accumulo.core.conf.AccumuloConfiguration;
 import org.apache.accumulo.core.data.Mutation;
 import org.apache.accumulo.core.data.impl.KeyExtent;
 import org.apache.accumulo.core.metadata.RootTable;
 import org.apache.accumulo.server.fs.VolumeManager;
+import org.apache.accumulo.server.fs.VolumeManagerImpl;
+import org.apache.accumulo.server.log.SortedLogState;
 import org.apache.accumulo.tserver.logger.LogEvents;
 import org.apache.accumulo.tserver.logger.LogFileKey;
 import org.apache.accumulo.tserver.logger.LogFileValue;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.Text;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.beust.jcommander.Parameter;
 import com.google.common.base.Function;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.Iterators;
@@ -191,15 +205,21 @@ public class SortedLogRecovery {
             lastStartFile = key.filename;
             break;
           case COMPACTION_FINISH:
-            checkState(key.seq > lastStart, "Compaction finish <= start %s %s %s", key.tabletId,
-                key.seq, lastStart);
-            checkState(lastEvent != COMPACTION_FINISH,
-                "Saw consecutive COMPACTION_FINISH events %s %s %s", key.tabletId, lastFinish,
-                key.seq);
+            if (key.seq <= lastStart) {
+              throw new LogRecoveryException(key.tserverSession, key.tabletId,
+                  format("Compaction finish <= start %s %s %s", key.tabletId, key.seq, lastStart));
+            }
+
+            if (lastEvent == COMPACTION_FINISH) {
+              throw new LogRecoveryException(key.tserverSession, key.tabletId,
+                  format("Saw consecutive COMPACTION_FINISH events %s %s %s", key.tabletId,
+                      lastFinish, key.seq));
+            }
             lastFinish = key.seq;
             break;
           default:
-            throw new IllegalStateException("Non compaction event seen " + key.event);
+            throw new LogRecoveryException(key.tserverSession, tabletId,
+                "Non compaction event seen " + key.event);
         }
 
         lastEvent = key.event;
